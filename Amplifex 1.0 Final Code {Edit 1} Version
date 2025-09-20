@@ -1,0 +1,459 @@
+# ================================================================
+#  Amplifex – 3 A4 PNGs  +  user-friendly downloader  (FIXED)
+# ================================================================
+#  ➜ Paste entire cell, run, then choose what to download
+# ================================================================
+
+# ---------- one-time installs ----------
+!pip install biopython pandas numpy matplotlib pillow requests --quiet
+
+# ---------- imports ----------
+import os, subprocess, re, io, math, datetime, shutil, zipfile, glob
+from collections import Counter          # ←–––– FIX
+import matplotlib.pyplot as plt
+from PIL import Image, ImageDraw, ImageFont
+import numpy as np
+from Bio.Seq import Seq
+from google.colab import files           # downloader
+
+# ---------- download TRF ----------
+TRF_BIN = "/content/trf409.linux64"
+if not os.path.exists(TRF_BIN):
+    try:
+        print("Downloading TRF …")
+        !wget -q -O /content/trf409.linux64.gz http://tandem.bu.edu/trf/trf409.linux64.gz     
+        !gunzip -f /content/trf409.linux64.gz && chmod +x /content/trf409.linux64
+        print("TRF ready.")
+    except Exception as e:
+        print("TRF download failed:", e); TRF_BIN = None
+
+# ---------- font helpers ----------
+def font_candidates():
+    return ["/usr/share/fonts/truetype/msttcorefonts/Times_New_Roman.ttf",
+            "/usr/share/fonts/truetype/liberation/LiberationSerif-Regular.ttf",
+            "/usr/share/fonts/truetype/dejavu/DejaVuSerif.ttf",
+            "/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf"]
+def get_font(size):
+    for p in font_candidates():
+        if os.path.exists(p):
+            try: return ImageFont.truetype(p, size)
+            except: pass
+    return ImageFont.load_default()
+
+# ---------- small utils ----------
+def revcomp(s): return str(Seq(s).reverse_complement())
+def wallace_tm(seq): s=seq.upper(); return 2*(s.count('A')+s.count('T')) + 4*(s.count('G')+s.count('C'))
+def gc_percent(s): s=s.upper(); return (s.count('G')+s.count('C'))/len(s)*100 if s else 0.0
+def shannon_entropy(s):
+    counts=Counter(s.upper()); L=len(s); ent=0.0
+    for v in counts.values():
+        p=v/L; ent-=p*math.log2(p)
+    return ent
+
+# ---------- repeat detectors ----------
+def find_ssr_regex(seq, thresholds={1:5,2:4,3:3,4:3,5:3}):
+    seq=seq.upper(); hits=[]
+    for unit in range(1,6):
+        min_cnt=thresholds.get(unit,3)
+        pat=re.compile(r'((?:[ACGT]{%d}))(?:\1){%d,}'%(unit,min_cnt-1))
+        for m in pat.finditer(seq):
+            u=m.group(1); st=m.start(); en=m.end()-1; reps=(en-st+1)//unit
+            hits.append({'unit':unit,'unitseq':u,'start':st,'end':en,'repeats':reps})
+    hits=sorted(hits,key=lambda x:(x['start'],-(x['end']-x['start']))); merged=[]
+    for h in hits:
+        if not merged or h['start']>merged[-1]['end']: merged.append(h)
+        else: merged[-1]['end']=max(merged[-1]['end'],h['end'])
+    return merged
+def run_trf(seq_str, work_prefix="/content/trf_temp"):
+    if not TRF_BIN or not os.path.exists(TRF_BIN): return None
+    fasta=work_prefix+".fa"
+    with open(fasta,"w") as fh: fh.write(">seq\n"+seq_str+"\n")
+    cmd=f"{TRF_BIN} {fasta} 2 7 7 80 10 50 500 -d -h"
+    try: subprocess.check_output(cmd,shell=True,stderr=subprocess.STDOUT,text=True,timeout=180)
+    except: return None
+    dat=fasta+".2.7.7.80.10.50.500.dat"
+    if not os.path.exists(dat): return None
+    parsed=[]
+    with open(dat) as fh:
+        for line in fh:
+            if not line.strip() or line.startswith(('@','Sequence:')): continue
+            parts=line.split()
+            try: parsed.append({'start':int(parts[0])-1,'end':int(parts[1])-1,'period':int(parts[2]),'copies':float(parts[3]),'consensus':parts[13] if len(parts)>13 else ""})
+            except: pass
+    return parsed
+def find_palindromes(seq, min_stem=4, max_stem=12, max_loop=20):
+    seq=seq.upper(); pals=[]; L=len(seq)
+    for i in range(L):
+        for stem in range(min_stem, min(max_stem+1,(L-i)//2+1)):
+            for loop in range(0,max_loop+1):
+                j=i+stem+loop
+                if j+stem>L: break
+                left=seq[i:i+stem]; right=seq[j:j+stem]
+                if left==revcomp(right):
+                    dg=0
+                    for a,b in zip(left,revcomp(right)):
+                        if set(a+b)==set('AT'): dg-=2
+                        elif set(a+b)==set('GC'): dg-=3
+                        else: dg-=2.5
+                    pals.append({'start':i,'end':j+stem-1,'stem':stem,'loop':loop,'dg':dg})
+    pals=[p for p in pals if p['dg']<-3]
+    pals=sorted(pals,key=lambda x:(x['start'],-x['end'])); merged=[]
+    for p in pals:
+        if not merged or p['start']>merged[-1]['end']: merged.append(p)
+        else: merged[-1]['end']=max(merged[-1]['end'],p['end'])
+    return merged
+def find_low_complexity(seq, window=20, entropy_threshold=1.2):
+    seq=seq.upper(); hits=[]; L=len(seq)
+    for i in range(L-window+1):
+        w=seq[i:i+window]
+        if shannon_entropy(w)<entropy_threshold: hits.append((i,i+window-1))
+    hits=sorted(hits); merged=[]
+    for s,e in hits:
+        if not merged or s>merged[-1][1]+1: merged.append([s,e])
+        else: merged[-1][1]=max(merged[-1][1],e)
+    return [{'start':s,'end':e} for s,e in merged]
+
+# ---------- primer heuristics ----------
+def has_long_run(seq, max_run=4): return bool(re.search(r'(A{%d,}|T{%d,}|G{%d,}|C{%d,})'%(max_run+1,max_run+1,max_run+1,max_run+1),seq))
+def complementarity_score(a,b):
+    rc=revcomp(b); maxrun=0
+    for i in range(len(a)):
+        for j in range(len(rc)):
+            run=0; ii=i; jj=j
+            while ii<len(a) and jj<len(rc) and a[ii]==rc[jj]: run+=1; ii+=1; jj+=1
+            if run>maxrun: maxrun=run
+    return maxrun
+def hairpin_score(primer, min_stem=4):
+    p=primer.upper(); L=len(p); maxstem=0
+    for stem in range(min_stem, min(8,L//2)+1):
+        for i in range(0,L-2*stem):
+            left=p[i:i+stem]; right=p[i+stem+1:i+2*stem+1]
+            if left==revcomp(right): maxstem=max(maxstem,stem)
+    return maxstem
+def score_primer(primer):
+    score=100; tm=wallace_tm(primer); gcp=gc_percent(primer); L=len(primer)
+    if L<18: score-=(18-L)*5
+    if L>25: score-=(L-25)*5
+    if gcp<40: score-=int((40-gcp)*1.5)
+    if gcp>60: score-=int((gcp-60)*1.5)
+    if primer[-1] in 'GC': score+=5
+    else: score-=5
+    if has_long_run(primer,4): score-=20
+    hp=hairpin_score(primer,4)
+    if hp>=4: score-=hp*5
+    cd=complementarity_score(primer,primer)
+    if cd>=4: score-=cd*5
+    return max(0,score),tm,gcp
+def generate_candidates(seq, region_start, region_end, direction='forward', min_len=18, max_len=25, slide=1, max_cands=400):
+    seg=seq[region_start:region_end]; cands=[]
+    for L in range(min_len,max_len+1):
+        for i in range(0,max(1,len(seg)-L+1),slide):
+            p=seg[i:i+L] if direction=='forward' else revcomp(seg[i:i+L])
+            sc,tm,gcp=score_primer(p)
+            cands.append({'seq':p,'start':region_start+i,'end':region_start+i+L-1,'length':L,'score':sc,'tm':tm,'gc':gcp,'direction':direction})
+    seen=set(); out=[]
+    for p in sorted(cands,key=lambda x:(-x['score'],abs(x['tm']-60))):
+        if p['seq'] in seen: continue
+        seen.add(p['seq']); out.append(p)
+        if len(out)>=max_cands: break
+    return out
+def pick_primers(fwd_list, rev_list, want=5):
+    chosen_f=[]; chosen_r=[]
+    for p in fwd_list:
+        if len(chosen_f)>=want: break
+        bad=False
+        for q in chosen_f:
+            if complementarity_score(p['seq'],q['seq'])>=6: bad=True; break
+        if not bad: chosen_f.append(p)
+    for p in rev_list:
+        if len(chosen_r)>=want: break
+        bad=False
+        for q in chosen_r:
+            if complementarity_score(p['seq'],q['seq'])>=6: bad=True; break
+        for f in chosen_f:
+            if complementarity_score(p['seq'],f['seq'])>=6: bad=True; break
+        if not bad: chosen_r.append(p)
+    if len(chosen_f)<want:
+        for p in fwd_list:
+            if p not in chosen_f: chosen_f.append(p)
+            if len(chosen_f)>=want: break
+    if len(chosen_r)<want:
+        for p in rev_list:
+            if p not in chosen_r: chosen_r.append(p)
+            if len(chosen_r)>=want: break
+    return chosen_f[:want], chosen_r[:want]
+
+# ---------- colours ----------
+COLOR_MAP={'homopolymer':(255,230,120),'dinuc':(102,204,102),'trinuc':(102,153,255),
+           'tetranuc':(255,153,102),'interspersed':(255,102,102),'palindrome':(180,102,255),
+           'lcr':(220,220,220),'primer_f':(34,139,34),'primer_r':(204,0,0),'between':(255,255,153)}
+
+# ---------- page geometry ----------
+A4_W,A4_H=2480,3508   # 300 dpi
+M=110                 # slightly bigger margin
+# ---------- font sizes (compressed) ----------
+title_f=get_font(52)
+sub_f=get_font(26)
+head_f=get_font(48)
+body_f=get_font(42)
+small_f=get_font(36)
+
+# ---------- user inputs ----------
+job_name=input("Enter job name (used for filename): ").strip()
+if not job_name: job_name="Amplifex_"+datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
+raw=input("Paste DNA sequence (A/T/C/G only) and press Enter:\n").strip()
+seq=re.sub(r'[^ATCGatcg]','',raw).upper()
+if len(seq)<10: raise SystemExit("Sequence too short; provide ≥10 bases.")
+print(f"Sequence length: {len(seq)} bp — building PNG reports...")
+
+# ---------- feature detection ----------
+total_len=len(seq); counts=Counter(seq); A,T,G,C=counts.get('A',0),counts.get('T',0),counts.get('G',0),counts.get('C',0)
+gc_pct=round((G+C)/total_len*100,2); gc_count=G+C
+trf_results=run_trf(seq) if TRF_BIN else None
+ssr_regex_hits=find_ssr_regex(seq)
+homopolymer_hits=[{'start':m.start(),'end':m.end()-1,'seq':m.group(0)} for m in re.finditer(r'(A{5,}|T{5,}|G{5,}|C{5,})',seq)]
+dinuc=[h for h in ssr_regex_hits if h['unit']==2]; trinuc=[h for h in ssr_regex_hits if h['unit']==3]; tetranuc=[h for h in ssr_regex_hits if h['unit']==4]
+pal_hits=find_palindromes(seq,min_stem=4,max_stem=12,max_loop=20)
+lcr_hits=find_low_complexity(seq,window=20,entropy_threshold=1.2)
+
+# ---------- primer design ----------
+region_span=min(200,total_len//2)
+fwd_candidates=generate_candidates(seq,0,region_span,'forward',18,25,1,400)
+rev_candidates=generate_candidates(seq,total_len-region_span,total_len,'reverse',18,25,1,400)
+fwd_sel,rev_sel=pick_primers(fwd_candidates,rev_candidates,want=5)
+
+# ---------- helper: header ----------
+def header(draw,title_txt):
+    tw=draw.textbbox((0,0),title_txt,font=title_f)[2]
+    draw.text(((A4_W-tw)//2,60),title_txt,font=title_f,fill="black")
+    sub="Designed by Muhammad Sohaib Hassan"
+    sw=draw.textbbox((0,0),sub,font=sub_f)[2]
+    draw.text(((A4_W-sw)//2,60+70),sub,font=sub_f,fill="black")
+    return 60+70+70
+
+# ---------- PAGE 1  SUMMARY ----------
+page1=Image.new("RGB",(A4_W,A4_H),"white"); d=ImageDraw.Draw(page1)
+y=header(d,"Amplifex")
+d.text((M,y),"Job Summary",font=head_f,fill="black"); y+=100
+d.text((M+20,y),f"Job: {job_name}",font=body_f,fill="black"); y+=65
+d.text((M+20,y),f"Sequence length: {total_len} bases",font=body_f,fill="black"); y+=65
+d.text((M+20,y),f"GC content: {gc_pct}% ({gc_count}/{total_len})",font=body_f,fill="black"); y+=65
+d.text((M+20,y),f"Counts — A: {A}  T: {T}  G: {G}  C: {C}",font=body_f,fill="black"); y+=100
+d.text((M,y),"Detected features:",font=head_f,fill="black"); y+=100
+features=[('Homopolymers (≥5)',len(homopolymer_hits)),('Dinuc repeats (≥4)',len(dinuc)),
+          ('Trinuc repeats (≥3)',len(trinuc)),('Tetranuc repeats (≥3)',len(tetranuc)),
+          ('Palindromes (ΔG<−3)',len(pal_hits)),('Low-complexity windows',len(lcr_hits))]
+for lab,cnt in features:
+    d.text((M+20,y),f"- {lab}: {cnt}",font=body_f,fill="black"); y+=60
+# benchmark
+d.text((M,y+40),"Benchmark / Relative values used:",font=head_f,fill="black"); y+=160
+d.text((M+20,y),f"GC optimal range: 40 – 60 %  (sample {gc_pct} %)",font=body_f,fill="black"); y+=65
+d.text((M+20,y),f"Primer length range: 18 – 25 nt",font=body_f,fill="black"); y+=65
+d.text((M+20,y),f"Annealing temp (Wallace): 60 ± 2 °C",font=body_f,fill="black"); y+=65
+d.text((M+20,y),f"Max homopolymer run: ≤ 4 nt",font=body_f,fill="black"); y+=65
+d.text((M+20,y),f"Max hairpin stem: ≤ 3 bp",font=body_f,fill="black"); y+=100
+
+# --- coloured sequence box ---
+box_x=M; box_w=A4_W-2*M
+tmp=ImageDraw.Draw(Image.new("RGB",(100,100)))
+if total_len>5000: base_font=get_font(36)
+elif total_len>2000: base_font=get_font(40)
+else: base_font=body_f
+base_w=tmp.textbbox((0,0),"A",font=base_font)[2]-tmp.textbbox((0,0),"A",font=base_font)[0]+12
+base_h=tmp.textbbox((0,0),"A",font=base_font)[3]-tmp.textbbox((0,0),"A",font=base_font)[1]+16
+cols=max(1,(box_w-40)//base_w)
+lines=[seq[i:i+cols] for i in range(0,len(seq),cols)]
+usable_h=A4_H-(y+150); lines_per_page=max(1,usable_h//base_h)
+line_idx=0; page1_count=0
+while line_idx<len(lines):
+    if page1_count==0:
+        cur_page=page1; cur_draw=d; cur_y=y
+    else:
+        cur_page=Image.new("RGB",(A4_W,A4_H),"white"); cur_draw=ImageDraw.Draw(cur_page); cur_y=header(cur_draw,"Amplifex")
+    cur_draw.text((box_x,cur_y),"Complete DNA Description",font=head_f,fill="black"); cur_y+=100
+    box_top=cur_y
+    take=min(lines_per_page,len(lines)-line_idx)
+    box_h=take*base_h+30
+    cur_draw.rectangle([box_x,box_top,box_x+box_w,box_top+box_h],outline="black",width=2)
+    sx=box_x+15; sy=box_top+15
+    for lno in range(take):
+        row=lines[line_idx+lno]
+        xx=sx
+        for c_idx,base in enumerate(row):
+            pos=(line_idx+lno)*cols+c_idx
+            fill=None
+            for h in homopolymer_hits:
+                if h['start']<=pos<=h['end']: fill=COLOR_MAP['homopolymer']; break
+            if not fill:
+                for h in dinuc+trinuc+tetranuc:
+                    if h['start']<=pos<=h['end']: fill=COLOR_MAP[f"{'dinuc' if h['unit']==2 else 'trinuc' if h['unit']==3 else 'tetranuc'}"]; break
+            if not fill:
+                for p in pal_hits:
+                    if p['start']<=pos<=p['end']: fill=COLOR_MAP['palindrome']; break
+            if not fill:
+                for l in lcr_hits:
+                    if l['start']<=pos<=l['end']: fill=COLOR_MAP['lcr']; break
+            if not fill and base in 'GC': fill=(255,255,200)
+            bb=cur_draw.textbbox((0,0),base,font=base_font); w=bb[2]-bb[0]; h=bb[3]-bb[1]
+            if fill: cur_draw.rectangle([xx-6,sy-6,xx+w+6,sy+h+6],fill=fill)
+            cur_draw.text((xx,sy),base,font=base_font,fill="black"); xx+=base_w
+        sy+=base_h
+    # legend on last page
+    if line_idx+take>=len(lines):
+        ly=box_top+box_h+30; lx=box_x
+        legend=[('Homopolymer (≥5)','homopolymer'),('Dinuc (≥4)','dinuc'),
+                ('Trinuc (≥3)','trinuc'),('Tetranuc (≥3)','tetranuc'),
+                ('Palindrome (ΔG<−3)','palindrome'),('Low-complexity','lcr'),('GC bases','GC')]
+        for lab,typ in legend:
+            if typ=='GC': cur_draw.rectangle([lx,ly,lx+24,ly+24],fill=(255,255,200))
+            else: cur_draw.rectangle([lx,ly,lx+24,ly+24],fill=COLOR_MAP[typ])
+            cur_draw.text((lx+32,ly),lab,font=body_f,fill="black"); lx+=600
+    fname=f"Amplifex_1_Summary{'' if page1_count==0 else '_extra'+str(page1_count)}.png"
+    cur_page.save(fname,dpi=(300,300))
+    line_idx+=take; page1_count+=1
+
+# ---------- PAGE 2  CHARTS  (2×2 grid) ----------
+figs=[]
+# 1. base pie
+fig,ax=plt.subplots(figsize=(5.5,5.5))
+ax.pie([A,T,G,C], labels=['A','T','G','C'], autopct='%1.1f%%', startangle=90,
+       textprops={'fontsize':30})
+ax.set_title("Base composition", fontsize=42, pad=15)
+figs.append(fig)
+
+# 2. GC gauge
+fig,ax=plt.subplots(figsize=(9,3))
+ax.set_xlim(0,100); ax.set_ylim(0,1)
+ax.axvspan(40,60,color='green',alpha=.15)
+ax.barh(0.5,gc_pct,height=0.4,color='steelblue')
+ax.text(gc_pct+1,0.5,f"{gc_pct}%",va='center',fontsize=30)
+ax.set_yticks([]); ax.set_xlabel('GC %',fontsize=30)
+ax.set_title("GC content",fontsize=42,pad=15)
+ax.tick_params(axis='x',labelsize=26)
+figs.append(fig)
+
+# 3. feature pie
+feat_counts={'Homopolymer':len(homopolymer_hits),'Dinuc':len(dinuc),
+             'Trinuc':len(trinuc),'Tetranuc':len(tetranuc),
+             'Palindromes':len(pal_hits),'LowComplexity':len(lcr_hits)}
+labels=[k for k,v in feat_counts.items() if v]; vals=[v for k,v in feat_counts.items() if v]
+fig,ax=plt.subplots(figsize=(5.5,5.5))
+if sum(vals)==0:
+    ax.text(0.5,0.5,"No special repeats",ha='center',va='center',fontsize=30,
+            transform=ax.transAxes)
+else:
+    ax.pie(vals,labels=labels,autopct='%1.1f%%',startangle=90,
+           textprops={'fontsize':26})
+ax.set_title("Feature composition",fontsize=42,pad=15)
+figs.append(fig)
+
+# 4. base bar
+fig,ax=plt.subplots(figsize=(6.5,4.5))
+ax.bar(['A','T','G','C'],[A,T,G,C],color=['#1f77b4','#ff7f0e','#2ca02c','#d62728'])
+ax.set_title("Base counts",fontsize=42,pad=15)
+ax.tick_params(axis='x',labelsize=30)
+ax.tick_params(axis='y',labelsize=26)
+figs.append(fig)
+
+# convert charts → PIL images
+chart_imgs=[]
+for f in figs:
+    b=io.BytesIO()
+    f.tight_layout()
+    f.savefig(b,format='png',dpi=150)
+    plt.close(f)
+    b.seek(0)
+    chart_imgs.append(Image.open(b).convert("RGB"))
+
+# ---- build clean 2×2 page ----
+page2=Image.new("RGB",(A4_W,A4_H),"white")
+d=ImageDraw.Draw(page2)
+y=header(d,"Amplifex – Charts & Feature Breakdown")
+
+# grid geometry
+cols=2; rows=2
+thumb_w,thumb_h=880,650          # shrunk to fit
+gap_x,gap_y=100,120
+start_x=M; start_y=y+140
+
+for idx,img in enumerate(chart_imgs):
+    r,c=divmod(idx,cols)
+    x=start_x+c*(thumb_w+gap_x)
+    y_slot=start_y+r*(thumb_h+gap_y)
+    page2.paste(img.resize((thumb_w,thumb_h)),(x,y_slot))
+
+# --- compressed benchmark ---
+cy=start_y+rows*(thumb_h+gap_y)+100
+d.text((M,cy),"Benchmark / Relative values used:",font=head_f,fill="black"); cy+=100
+d.text((M+20,cy),f"GC optimal range: 40 – 60 %  (sample {gc_pct} %)",font=small_f,fill="black"); cy+=50
+d.text((M+20,cy),"Entropy threshold low-complexity: < 1.2 bits",font=small_f,fill="black"); cy+=50
+d.text((M+20,cy),"Palindrome ΔG cut-off: < −3 kcal/mol",font=small_f,fill="black"); cy+=50
+
+page2.save("Amplifex_2_Charts.png",dpi=(300,300))
+
+# ---------- PAGE 3  PRIMERS ----------
+page3=Image.new("RGB",(A4_W,A4_H),"white"); d=ImageDraw.Draw(page3)
+y=header(d,"Amplifex – Best Primer Pairs")
+y+=100
+for idx,(f,r) in enumerate(zip(fwd_sel,rev_sel),1):
+    d.text((M,y),f"Pair {idx}",font=head_f,fill="black"); y+=130
+    d.text((M+20,y),f"Forward  {idx}: {f['seq']}   pos {f['start']+1}-{f['end']+1}   len {f['length']}   GC {f['gc']:.1f}%   Tm {f['tm']}   score {f['score']}",font=body_f,fill="black"); y+=80
+    d.text((M+20,y),f"Reverse  {idx}: {r['seq']}   pos {r['start']+1}-{r['end']+1}   len {r['length']}   GC {r['gc']:.1f}%   Tm {r['tm']}   score {r['score']}",font=body_f,fill="black"); y+=80
+    amp_len=abs(r['end']-f['start'])+1
+    d.text((M+20,y),f"Amplicon size: {amp_len} bp",font=small_f,fill="black"); y+=160
+# compressed benchmark
+d.text((M,y),"Benchmark / Relative values used:",font=head_f,fill="black"); y+=100
+d.text((M+20,y),f"GC optimal range: 40 – 60 %",font=small_f,fill="black"); y+=50
+d.text((M+20,y),f"Primer length range: 18 – 25 nt",font=small_f,fill="black"); y+=50
+d.text((M+20,y),f"Annealing temp (Wallace): 60 ± 2 °C",font=small_f,fill="black"); y+=50
+d.text((M+20,y),f"Max homopolymer run: ≤ 4 nt",font=small_f,fill="black"); y+=50
+d.text((M+20,y),f"Max hairpin stem: ≤ 3 bp",font=small_f,fill="black"); y+=50
+d.text((M+20,y),f"Max primer-dimer overlap: ≤ 5 bp",font=small_f,fill="black"); y+=50
+
+page3.save("Amplifex_3_Primers.png",dpi=(300,300))
+
+# ---------- collect what was actually created ----------
+pngs_created=glob.glob("Amplifex_*.png")          # every PNG we just wrote
+ts=datetime.datetime.now().strftime("%H%M%S")     # unique every second
+print("\nImages ready.")
+while True:
+    choice=input(
+        "\n1  Analysis of your sequence (summary page)\n"
+        "2  Graphs / tables for your paper (charts page)\n"
+        "3  Best primer pairs (primers page)\n"
+        "0  Full data – all PNGs in one ZIP\n"
+        "4  Full data – merged PDF\n"
+        "→  Type 1,2,3,0,4 and press Enter: "
+    ).strip()
+    if choice in {"0","1","2","3","4"}: break
+    print("Invalid choice – try again.")
+
+if choice=="0":
+    zip_name=f"{job_name}_{ts}_full_data.zip"
+    with zipfile.ZipFile(zip_name,"w",compression=zipfile.ZIP_DEFLATED) as z:
+        for p in pngs_created: z.write(p)
+    files.download(zip_name)
+
+elif choice in {"1","2","3"}:
+    idx=int(choice)-1
+    wanted=["Amplifex_1_Summary.png","Amplifex_2_Charts.png","Amplifex_3_Primers.png"][idx]
+    # pick the first file that matches the requested type
+    matches=[p for p in pngs_created if os.path.basename(p).startswith(wanted.replace(".png",""))]
+    if not matches:
+        print("Requested image was not created – probably extra-long sequence generated only multi-page files.")
+        print("Choose 0 (ZIP) to grab everything.")
+    else:
+        new_name=f"{job_name}_{ts}_{os.path.basename(matches[0])}"
+        shutil.copy(matches[0],new_name)
+        files.download(new_name)
+
+elif choice=="4":
+    pdf_name=f"{job_name}_{ts}_full_data.pdf"
+    images=[Image.open(png).convert("RGB") for png in sorted(pngs_created)]
+    if not images:
+        print("No images found – nothing to merge.")
+    else:
+        images[0].save(pdf_name,save_all=True,append_images=images[1:],dpi=(300,300))
+        files.download(pdf_name)
+
+print("Download started – check your browser.")
